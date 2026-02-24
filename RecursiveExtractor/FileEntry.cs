@@ -40,8 +40,10 @@ namespace Microsoft.CST.RecursiveExtractor
             ModifyTime = modifyTime ?? DateTime.MinValue;
             AccessTime = accessTime ?? DateTime.MinValue;
 
-            // Sanitize so its safe to use with Path APIs
-            string sanitizedName = SanitizePath(name);
+            // Sanitize traversal and absolute paths first while path structure is intact
+            string zipSlipSafeName = ZipSlipSanitize(name);
+            // Then replace any remaining OS-invalid characters
+            string sanitizedName = SanitizePath(zipSlipSafeName);
             Name = Path.GetFileName(sanitizedName);
 
             // If parent is null use the provided name as the FullPath
@@ -297,25 +299,76 @@ namespace Microsoft.CST.RecursiveExtractor
         }
 
         /// <summary>
-        /// Replace .. for ZipSlip and remove any doubled up directory separators as a result - https://snyk.io/research/zip-slip-vulnerability
+        /// Sanitize paths to prevent ZipSlip (directory traversal) and absolute path traversal.
+        /// Strips leading directory separators and drive letter roots, removes ".." sequences,
+        /// and collapses resulting double separators. See https://snyk.io/research/zip-slip-vulnerability
         /// </summary>
         /// <param name="fullPath">The path to sanitize</param>
         /// <param name="replacement">The string to replace .. with</param>
-        /// <returns>A path without ZipSlip</returns>
+        /// <returns>A relative path safe from directory traversal</returns>
         [Pure]
-        private static string ZipSlipSanitize(string fullPath, string replacement = "")
+        internal static string ZipSlipSanitize(string fullPath, string replacement = "")
         {
-            if (fullPath.Contains(".."))
+            // Normalize all separators to the OS-native separator
+            fullPath = fullPath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+
+            // Strip drive letter roots and leading separators. Must run before and after ".."
+            // removal because ".." removal can expose a new drive root (e.g. "../C:\file" → "C:\file").
+            fullPath = StripLeadingRootComponents(fullPath);
+
+            if (fullPath.Length > 0)
             {
-                fullPath = fullPath.Replace("..", replacement);
-                var directorySeparator = Path.DirectorySeparatorChar.ToString();
-                var doubleSeparator = $"{directorySeparator},{directorySeparator}";
-                while (fullPath.Contains(doubleSeparator))
+                var separator = Path.DirectorySeparatorChar;
+                var segments = fullPath.Split(separator);
+
+                for (var i = 0; i < segments.Length; i++)
                 {
-                    fullPath = fullPath.Replace(doubleSeparator, $"{directorySeparator}");
+                    // Replace traversal segments (".." and ".") only when they are whole segments
+                    if (segments[i] == ".." || segments[i] == ".")
+                    {
+                        segments[i] = replacement;
+                    }
                 }
+
+                // Rebuild the path from non-empty segments
+                fullPath = string.Join(separator.ToString(), segments.Where(s => !string.IsNullOrEmpty(s)));
             }
 
+            fullPath = StripLeadingRootComponents(fullPath);
+
+            return fullPath;
+        }
+
+        /// <summary>
+        /// Repeatedly strips Windows drive letter roots (e.g. "C:\") and leading directory
+        /// separators until the path is stable. A single pass is insufficient for crafted paths
+        /// like "D:\C:\" where stripping "D:" exposes a new root "C:\".
+        /// </summary>
+        private static string StripLeadingRootComponents(string fullPath)
+        {
+            bool changed;
+            do
+            {
+                changed = false;
+
+                // Strip Windows drive letter roots (e.g., "C:\", "D:/") but not relative names like "a:file.txt"
+                if (fullPath.Length >= 3
+                    && char.IsLetter(fullPath[0])
+                    && fullPath[1] == ':'
+                    && fullPath[2] == Path.DirectorySeparatorChar)
+                {
+                    fullPath = fullPath.Substring(2);
+                    changed = true;
+                }
+
+                // Strip leading directory separators to prevent absolute path traversal
+                while (fullPath.Length > 0 && fullPath[0] == Path.DirectorySeparatorChar)
+                {
+                    fullPath = fullPath.Substring(1);
+                    changed = true;
+                }
+            }
+            while (changed);
             return fullPath;
         }
 
